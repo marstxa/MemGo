@@ -33,10 +33,11 @@ func main() {
 			return
 		}
 
-		// print the parsed command array to the server logs
-		fmt.Printf("Parsed Command: %+v\n", value.Array)
+		
+		_ = value
 
-		// ignore request and send back PONG
-		conn.Write([]byte("+OK\r\n"))
+		// respond through writer
+		writer := resp.NewWriter(conn)
+		writer.Write(resp.Value{Typ: "string", Str: "OK"})
 	}
 }

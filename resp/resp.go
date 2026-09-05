@@ -28,10 +28,31 @@ type Resp struct {
 
 }
 
+type Writer struct {
+	Writer io.Writer
+}
+
+// Write the bytes we get from marshal methods to the writer
+func NewWriter(w io.Writer) *Writer {
+	return &Writer{Writer: w}
+}
+
+func (w *Writer) Write(v Value) error {
+	var bytes = v.Marshal()
+
+	_, err := w.Writer.Write(bytes)
+	if err != nil {
+		return err 
+	}
+
+	return nil
+}
+
 // NewResp  creates a new wrapper aroundd the TCP connection
 func NewResp(rd io.Reader) *Resp {
 	return &Resp{reader: bufio.NewReader(rd)}
 }
+
 
 func (r *Resp) readLine() (line []byte, n int, err error){
 	for {
@@ -124,4 +145,72 @@ func (r *Resp) readBulk() (Value, error){
 
 	return v, nil
 }
- 
+
+// Writing value serializer
+// Marshal values to bytes
+func (v Value) Marshal() []byte {
+	switch v.Typ {
+	case "array":
+		return v.marshalArray()
+	case "bulk":
+		return v.marshalBulk()
+	case "string":
+		return v.marshalString()
+	case "Null":
+		return v.marshalNull()
+	case "error":
+		return v.marshalError()
+	default:
+		return []byte{}
+	}
+}
+
+func (v Value) marshalString() []byte {
+	var bytes []byte
+
+	bytes =  append(bytes, STRING)
+	bytes =  append(bytes, v.Str...)
+	bytes = append(bytes, '\r', '\n')
+
+	return bytes
+}
+
+func (v Value) marshalBulk() []byte {
+	var bytes []byte
+
+	bytes = append(bytes, BULK)
+	bytes = append(bytes, strconv.Itoa(len(v.Bulk))...)
+	bytes = append(bytes, '\r', '\n')
+	bytes = append(bytes, v.Bulk...)
+	bytes = append(bytes, '\r', '\n')
+	
+	return bytes
+}
+
+func (v Value) marshalArray() []byte {
+	len := len(v.Array)
+	var bytes []byte
+
+	bytes = append(bytes, ARRAY)
+	bytes = append(bytes, strconv.Itoa(len)...)
+	bytes = append(bytes, '\r', '\n')
+
+	for i:=0; i < len;i++ {
+		bytes = append(bytes, v.Array[i].Marshal()...)
+	}
+
+	return bytes
+}
+
+func (v Value) marshalError() []byte {
+	var bytes []byte
+	bytes = append(bytes, ERROR)
+	bytes = append(bytes, v.Str...)
+	bytes = append(bytes, '\r', '\n')
+
+	return bytes
+}
+
+func (v Value) marshalNull() []byte {
+	return []byte("$-1\r\n")
+}
