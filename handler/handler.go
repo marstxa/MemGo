@@ -9,21 +9,23 @@ import (
 
 // Handlers maps supported Redis commands to their execution functions.
 var Handlers = map[string]func([]resp.Value) resp.Value{
-	"PING": ping,
-	"SET": set,
-	"GET": get,
-	"HSET": hset,
-	"HGET": hget,
+	"PING":    ping,
+	"SET":     set,
+	"GET":     get,
+	"HSET":    hset,
+	"HGET":    hget,
 	"HGETALL": hgetall,
 }
 
 // SETs is the primary key-value store for Strings.
 var SETs = map[string]string{}
+
 // SETsMu ensures thread-safe access to the SETs map.
 var SETsMu = sync.RWMutex{}
 
 // HSETs is the key-value store for Hashes (maps within maps).
 var HSETs = map[string]map[string]string{}
+
 // HSETsMu ensures thread-safe access to the HSETs map.
 var HSETsMu = sync.RWMutex{}
 
@@ -60,11 +62,11 @@ func get(args []resp.Value) resp.Value {
 	value, ok := SETs[key]
 	SETsMu.RUnlock()
 
-	if !ok{
+	if !ok {
 		return resp.Value{Typ: "null"}
 	}
 
-	return resp.Value{Typ: "bulk",  Bulk: value}
+	return resp.Value{Typ: "bulk", Bulk: value}
 }
 
 // hset sets the string value of a hash field.

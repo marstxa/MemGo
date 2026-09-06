@@ -13,47 +13,58 @@ import (
 func main() {
 	fmt.Println("Listening on port :6379")
 
-	// create new server
-	l, err := net.Listen("tcp", ":6379")
+	// data persistence with aof
+	aofFile, err := aof.NewAof("database.aof")
+
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		fmt.Println("Failed to create AOF: ", err)
 		return
 	}
 
-	// data persistence with aof
-	aof, err := aof.NewAof("database.aof")
+	defer aofFile.Close()
 
+	aofFile.Read(func(value resp.Value) {
+		command := strings.ToUpper(value.Array[0].Bulk)
+		args := value.Array[1:]
+
+		commandFunc, ok := handler.Handlers[command]
+		if !ok {
+			fmt.Println("Invalid command in AOF: ", command)
+			return
+		}
+
+		commandFunc(args)
+	})
+
+	// create new server
+	l, err := net.Listen("tcp", ":6379")
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	defer aof.Close()
-
-	aof.Read(func(value resp.Value) {
-		command := strings.ToUpper(value.Array[0].Bulk)
-		args := value.Array[1:]
-
-		handler, ok := handler.Handlers[command]
-		if !ok {
-			fmt.Println("Invalid command: ", command)
-			return
-		}
-
-		handler(args)
-	})
 
 	// listen for connections
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		return
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection: ", err.Error())
+			continue
+		}
+		// go routine to handle concurrent clients
+		go handleConn(conn, aofFile)
 	}
+
+}
+
+func handleConn(conn net.Conn, aofFile *aof.Aof) {
+
 	defer conn.Close()
 
 	for {
 		// initialise parser by wrapping the connection
 		parser := resp.NewResp(conn)
-		
+
 		// attempt to parse a full RESP value
 		value, err := parser.Read()
 		if err != nil {
@@ -76,19 +87,20 @@ func main() {
 
 		writer := resp.NewWriter(conn)
 
-		handler, ok := handler.Handlers[command]
-		
+		commandFunc, ok := handler.Handlers[command]
+
 		if !ok {
 			fmt.Println("Invalid command ", command)
 			writer.Write(resp.Value{Typ: "string", Str: ""})
 			continue
 		}
 
+		// Write mutations to the AOF file before executing
 		if command == "SET" || command == "HSET" {
-			aof.Write(value)
+			aofFile.Write(value)
 		}
 
-		result := handler(args)
+		result := commandFunc(args)
 		writer.Write(result)
 
 	}
