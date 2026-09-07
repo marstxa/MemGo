@@ -16,16 +16,15 @@ const (
 )
 
 type Value struct {
-	Typ string
-	Str string
-	Num int
-	Bulk string
+	Typ   string
+	Str   string
+	Num   int
+	Bulk  string
 	Array []Value
 }
 
 type Resp struct {
 	reader *bufio.Reader
-
 }
 
 type Writer struct {
@@ -42,7 +41,7 @@ func (w *Writer) Write(v Value) error {
 
 	_, err := w.Writer.Write(bytes)
 	if err != nil {
-		return err 
+		return err
 	}
 
 	return nil
@@ -53,8 +52,7 @@ func NewResp(rd io.Reader) *Resp {
 	return &Resp{reader: bufio.NewReader(rd)}
 }
 
-
-func (r *Resp) readLine() (line []byte, n int, err error){
+func (r *Resp) readLine() (line []byte, n int, err error) {
 	for {
 		b, err := r.reader.ReadByte()
 		if err != nil {
@@ -68,13 +66,13 @@ func (r *Resp) readLine() (line []byte, n int, err error){
 		}
 	}
 
-	return line[:len(line) -2], n, nil
+	return line[:len(line)-2], n, nil
 }
 
 func (r *Resp) readInteger() (x int, n int, err error) {
 	line, n, err := r.readLine()
 	if err != nil {
-		return 0, 0, err 
+		return 0, 0, err
 	}
 
 	i64, err := strconv.ParseInt(string(line), 10, 64)
@@ -102,22 +100,22 @@ func (r *Resp) Read() (Value, error) {
 	}
 }
 
-func (r *Resp) readArray() (Value, error){
+func (r *Resp) readArray() (Value, error) {
 	v := Value{}
 	v.Typ = "array"
 
 	// read len of the array
 	length, _, err := r.readInteger()
 	if err != nil {
-		return v, err 
+		return v, err
 	}
 
 	// for each line parse and read the value
 	v.Array = make([]Value, length)
-	for i:=0;i < length; i++ {
+	for i := 0; i < length; i++ {
 		val, err := r.Read()
 		if err != nil {
-			return v, err 
+			return v, err
 		}
 
 		// add parsed value to array
@@ -127,13 +125,13 @@ func (r *Resp) readArray() (Value, error){
 	return v, nil
 }
 
-func (r *Resp) readBulk() (Value, error){
+func (r *Resp) readBulk() (Value, error) {
 	v := Value{}
 	v.Typ = "bulk"
 
 	len, _, err := r.readInteger()
 	if err != nil {
-		return v, err 
+		return v, err
 	}
 
 	bulk := make([]byte, len)
@@ -154,9 +152,11 @@ func (v Value) Marshal() []byte {
 		return v.marshalArray()
 	case "bulk":
 		return v.marshalBulk()
+	case "integer":
+		return v.marshalInteger()
 	case "string":
 		return v.marshalString()
-	case "Null":
+	case "null":
 		return v.marshalNull()
 	case "error":
 		return v.marshalError()
@@ -168,8 +168,8 @@ func (v Value) Marshal() []byte {
 func (v Value) marshalString() []byte {
 	var bytes []byte
 
-	bytes =  append(bytes, STRING)
-	bytes =  append(bytes, v.Str...)
+	bytes = append(bytes, STRING)
+	bytes = append(bytes, v.Str...)
 	bytes = append(bytes, '\r', '\n')
 
 	return bytes
@@ -183,7 +183,17 @@ func (v Value) marshalBulk() []byte {
 	bytes = append(bytes, '\r', '\n')
 	bytes = append(bytes, v.Bulk...)
 	bytes = append(bytes, '\r', '\n')
-	
+
+	return bytes
+}
+
+func (v Value) marshalInteger() []byte {
+	var bytes []byte
+
+	bytes = append(bytes, INTEGER)
+	bytes = append(bytes, []byte(strconv.Itoa(v.Num))...)
+	bytes = append(bytes, '\r', '\n')
+
 	return bytes
 }
 
@@ -195,7 +205,7 @@ func (v Value) marshalArray() []byte {
 	bytes = append(bytes, strconv.Itoa(len)...)
 	bytes = append(bytes, '\r', '\n')
 
-	for i:=0; i < len;i++ {
+	for i := 0; i < len; i++ {
 		bytes = append(bytes, v.Array[i].Marshal()...)
 	}
 

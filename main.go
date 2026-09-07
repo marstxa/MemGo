@@ -96,7 +96,7 @@ func handleConn(conn net.Conn, aofFile *aof.Aof) {
 		}
 
 		// Write mutations to the AOF file before executing
-		if command == "SET" || command == "HSET" {
+		if command == "SET" || command == "HSET" || command == "DEL" || command == "HDEL" {
 			aofFile.Write(value)
 		}
 
