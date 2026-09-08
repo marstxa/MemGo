@@ -8,10 +8,15 @@ import (
 	"github.com/marstxa/aof"
 	"github.com/marstxa/handler"
 	"github.com/marstxa/resp"
+	"github.com/marstxa/store"
 )
 
 func main() {
 	fmt.Println("Listening on port :6379")
+
+	// initialise store and handler
+	s := store.New()
+	h := handler.New(s)
 
 	// data persistence with aof
 	aofFile, err := aof.NewAof("database.aof")
@@ -27,7 +32,7 @@ func main() {
 		command := strings.ToUpper(value.Array[0].Bulk)
 		args := value.Array[1:]
 
-		commandFunc, ok := handler.Handlers[command]
+		commandFunc, ok := h.Handlers[command]
 		if !ok {
 			fmt.Println("Invalid command in AOF: ", command)
 			return
@@ -52,13 +57,12 @@ func main() {
 			continue
 		}
 		// go routine to handle concurrent clients
-		go handleConn(conn, aofFile)
+		go handleConn(conn, aofFile, h)
 	}
 
 }
 
-func handleConn(conn net.Conn, aofFile *aof.Aof) {
-
+func handleConn(conn net.Conn, aofFile *aof.Aof, h *handler.Handler) {
 	defer conn.Close()
 
 	for {
@@ -87,7 +91,7 @@ func handleConn(conn net.Conn, aofFile *aof.Aof) {
 
 		writer := resp.NewWriter(conn)
 
-		commandFunc, ok := handler.Handlers[command]
+		commandFunc, ok := h.Handlers[command]
 
 		if !ok {
 			fmt.Println("Invalid command ", command)
