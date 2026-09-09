@@ -15,6 +15,17 @@ const (
 	LEADER
 )
 
+type RequestVoteArgs struct {
+	Term        int
+	CandidateID string
+	// TODO: LastLogIndex, LastLogTerm
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
 type LogEntry struct {
 	Index   int    // Serial number
 	Term    int    // Election term this was created in
@@ -88,4 +99,58 @@ func (rn *RaftNode) StartElection() {
 
 func (rn *RaftNode) requestVotes(term int) {
 	fmt.Println("Asking peers for votes...")
+
+	rn.mu.Lock()
+	votesReceived := 1 // voted for ourselves already
+
+	// Need more than half of the total servers to win
+	majority := (len(rn.peers)+1)/2 + 1
+	rn.mu.Unlock()
+
+	for _, peer := range rn.peers {
+		go func(peerAddr string) {
+			args := RequestVoteArgs{
+				Term:        term,
+				CandidateID: rn.id,
+			}
+
+			var reply RequestVoteReply
+			err := rn.sendRPC(peerAddr, "RaftNode.RequestVote", args, &reply)
+
+			if err == nil {
+				rn.mu.Lock()
+				defer rn.mu.Unlock()
+
+				// check if followers told us term is too old
+				if reply.Term > rn.currentTerm {
+					rn.stepDown(reply.Term)
+					return
+				}
+
+				if rn.state == CANDIDATE && rn.currentTerm == term && reply.VoteGranted {
+					votesReceived++
+					fmt.Printf("Node %s got a vote from %s (Total: %d/%d)\n", rn.id, peerAddr, votesReceived, majority)
+
+					if votesReceived >= majority {
+						rn.becomeLeader()
+					}
+				}
+			}
+		}(peer)
+	}
+}
+
+func (rn *RaftNode) becomeLeader() {
+	rn.state = LEADER
+	fmt.Printf("Node %s WON THE ELECTION! Now Leader for Term %d\n", rn.id, rn.currentTerm)
+
+	// rn.sendHeartbeats()
+
+}
+
+func (rn *RaftNode) stepDown(newTerm int) {
+	rn.currentTerm = newTerm
+	rn.state = FOLLOWER
+	rn.votedFor = ""
+	fmt.Printf("Node %s stepping down to Follower for Term %d\n", rn.id, newTerm)
 }
