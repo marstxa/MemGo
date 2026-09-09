@@ -10,6 +10,11 @@ import (
 	"github.com/marstxa/resp"
 )
 
+type LogEntry struct {
+	Index   int    // Serial number
+	Term    int    // Election term this was created in
+	Command []byte // actual raw RESP
+}
 type Aof struct {
 	File *os.File
 	Rd   *bufio.Reader
