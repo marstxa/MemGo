@@ -140,6 +140,43 @@ func (rn *RaftNode) requestVotes(term int) {
 	}
 }
 
+func (rn *RaftNode) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// default reply "no you dont get my vote, work for it bud"
+	reply.VoteGranted = false
+	reply.Term = rn.currentTerm
+
+	// reject if candidate term older than ours
+	if args.Term < rn.currentTerm {
+		return nil
+	}
+
+	// term is newer, we must update and stepdown
+	if args.Term > rn.currentTerm {
+		rn.stepDown(args.Term)
+		reply.Term = rn.currentTerm
+	}
+
+	if rn.votedFor == "" || rn.votedFor == args.CandidateID {
+
+		rn.votedFor = args.CandidateID
+		reply.VoteGranted = true
+
+		// MUST reset election timer after we make a vote, so we dont start our own competing election
+		// use a non-blocking send so it doesnt freeze if the channel is full
+		select {
+		case rn.resetTimer <- struct{}{}:
+		default:
+		}
+
+		fmt.Printf("Node %s voted for %s in Term %d\n", rn.id, args.CandidateID, rn.currentTerm)
+	}
+
+	return nil
+}
+
 func (rn *RaftNode) becomeLeader() {
 	rn.state = LEADER
 	fmt.Printf("Node %s WON THE ELECTION! Now Leader for Term %d\n", rn.id, rn.currentTerm)
