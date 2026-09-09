@@ -3,6 +3,8 @@ package raft
 import (
 	"fmt"
 	"math/rand"
+	"net"
+	"net/rpc"
 	"sync"
 	"time"
 )
@@ -82,10 +84,15 @@ func (rn *RaftNode) runElectionTimer() {
 		select {
 		case <-rn.resetTimer:
 			// we received a hearbeat from a leader, loop restarts
-			fmt.Println("Timer reset by leader heartbeat")
-
+			// fmt.Println("Timer reset by leader heartbeat")
 		case <-time.After(timeout):
-			rn.StartElection()
+			rn.mu.Lock()
+			isLeader := rn.state == LEADER
+			rn.mu.Unlock()
+
+			if !isLeader {
+				rn.StartElection()
+			}
 		}
 	}
 }
@@ -101,9 +108,8 @@ func (rn *RaftNode) StartElection() {
 
 	fmt.Printf("Node %s starting election for Term %d\n", rn.id, rn.currentTerm)
 
-	rn.mu.Lock()
+	rn.mu.Unlock()
 
-	// TODO: ask all peers for their votes
 	rn.requestVotes(currentTerm)
 }
 
@@ -191,8 +197,7 @@ func (rn *RaftNode) becomeLeader() {
 	rn.state = LEADER
 	fmt.Printf("Node %s WON THE ELECTION! Now Leader for Term %d\n", rn.id, rn.currentTerm)
 
-	// rn.sendHeartbeats()
-
+	go rn.sendHeartbeats()
 }
 
 func (rn *RaftNode) stepDown(newTerm int) {
@@ -200,4 +205,117 @@ func (rn *RaftNode) stepDown(newTerm int) {
 	rn.state = FOLLOWER
 	rn.votedFor = ""
 	fmt.Printf("Node %s stepping down to Follower for Term %d\n", rn.id, newTerm)
+}
+
+func (rn *RaftNode) sendHeartbeats() {
+	for {
+		rn.mu.Lock()
+
+		if rn.state != LEADER {
+			rn.mu.Unlock()
+			return
+		}
+		term := rn.currentTerm
+		leaderID := rn.id
+		rn.mu.Unlock()
+
+		// Send a heartbeat to every peer
+		for _, peer := range rn.peers {
+			go func(peerAddr string) {
+				args := AppendEntriesArgs{
+					Term:     term,
+					LeaderID: leaderID,
+				}
+				var reply AppendEntriesReply
+
+				err := rn.sendRPC(peerAddr, "RaftNode.AppendEntries", args, &reply)
+				if err == nil {
+					rn.mu.Lock()
+					defer rn.mu.Unlock()
+
+					if reply.Term > rn.currentTerm {
+						rn.stepDown(reply.Term)
+					}
+				}
+			}(peer)
+		}
+
+		// wait before sending the next round of hearbeats
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	reply.Success = false
+	reply.Term = rn.currentTerm
+
+	// reject if older term
+	if args.Term < rn.currentTerm {
+		return nil
+	}
+
+	// if we are a candidate, older leader and see a valid hearbeat, we lost the election so stepdown
+	if args.Term > rn.currentTerm || rn.state == CANDIDATE {
+		rn.stepDown(args.Term)
+		reply.Term = rn.currentTerm
+
+	}
+
+	select {
+	case rn.resetTimer <- struct{}{}:
+	default:
+	}
+
+	// TODO: add log later here
+
+	reply.Success = true
+	return nil
+}
+
+// dials a peer, calls a method and unmarshals the response
+func (rn *RaftNode) sendRPC(peerAddr, method string, args, reply interface{}) error {
+
+	client, err := rpc.Dial("tcp", peerAddr)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	return client.Call(method, args, reply)
+}
+
+// opens a TCP port and listen for incomping RPCs from other nodes
+func (rn *RaftNode) StartServer() error {
+	server := rpc.NewServer()
+
+	err := server.Register(rn)
+	if err != nil {
+		return err
+	}
+
+	// rn.id as our address
+	ln, err := net.Listen("tcp", rn.id)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Node %s is up and listening for Raft RPCs...\n", rn.id)
+
+	// run the accept loop in the bg
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				continue // keep trying
+			}
+
+			// hand to the RPC server
+			go server.ServeConn(conn)
+		}
+	}()
+
+	return nil
 }
