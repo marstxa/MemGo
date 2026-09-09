@@ -15,6 +15,16 @@ const (
 	LEADER
 )
 
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderID string
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
 type RequestVoteArgs struct {
 	Term        int
 	CandidateID string
