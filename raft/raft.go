@@ -20,8 +20,8 @@ const (
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderID     string
-	prevLogIndex int
-	prevLogTerm  int
+	PrevLogIndex int
+	PrevLogTerm  int
 	Entries      []LogEntry
 	LeaderCommit int
 }
@@ -71,10 +71,13 @@ type RaftNode struct {
 
 func NewRaftNode(id string, peers []string) *RaftNode {
 	rn := &RaftNode{
-		id:         id,
-		peers:      peers,
-		state:      FOLLOWER,
-		votedFor:   "",
+		id:       id,
+		peers:    peers,
+		state:    FOLLOWER,
+		votedFor: "",
+
+		// dummy
+		log:        []LogEntry{{Index: 0, Term: 0}},
 		resetTimer: make(chan struct{}, 1),
 	}
 	// start election VIVA LA DEMOCRACIA
@@ -235,14 +238,30 @@ func (rn *RaftNode) sendHeartbeats() {
 		}
 		term := rn.currentTerm
 		leaderID := rn.id
+		leaderCommit := rn.commitIndex
 		rn.mu.Unlock()
 
 		// Send a heartbeat to every peer
 		for _, peer := range rn.peers {
 			go func(peerAddr string) {
+				rn.mu.Lock()
+
+				nextIdx := rn.nextIndex[peerAddr]
+				prevLogIndex := nextIdx - 1
+				prevLogTerm := rn.log[prevLogIndex].Term
+
+				// gra and make a copy of all entries from nextIdx to the end of the log
+				entries := make([]LogEntry, len(rn.log[nextIdx:]))
+				copy(entries, rn.log[nextIdx:])
+				rn.mu.Unlock()
+
 				args := AppendEntriesArgs{
-					Term:     term,
-					LeaderID: leaderID,
+					Term:         term,
+					LeaderID:     leaderID,
+					PrevLogIndex: prevLogTerm,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      entries,
+					LeaderCommit: leaderCommit,
 				}
 				var reply AppendEntriesReply
 
@@ -253,6 +272,18 @@ func (rn *RaftNode) sendHeartbeats() {
 
 					if reply.Term > rn.currentTerm {
 						rn.stepDown(reply.Term)
+					}
+
+					// ONLY process reply if we are still the leader
+					if rn.state == LEADER && rn.currentTerm == term {
+						if reply.Success {
+							rn.nextIndex[peerAddr] = nextIdx + len(entries)
+							rn.matchIndex[peerAddr] = rn.nextIndex[peerAddr] - 1
+						} else {
+							// decrement index so we send older data to next heartbeat
+							rn.nextIndex[peerAddr]--
+							fmt.Printf("Follower %s rejected log; backtracking nextIndex to %d\n", peerAddr, rn.nextIndex[peerAddr])
+						}
 					}
 				}
 			}(peer)
@@ -336,4 +367,29 @@ func (rn *RaftNode) StartServer() error {
 	}()
 
 	return nil
+}
+
+func (rn *RaftNode) Submit(command []byte) (bool, int) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.state != LEADER {
+		return false, -1
+	}
+
+	index := len(rn.log)
+	term := rn.currentTerm
+
+	entry := LogEntry{
+		Index:   index,
+		Term:    term,
+		Command: command,
+	}
+
+	// append own log
+	rn.log = append(rn.log, entry)
+
+	fmt.Printf("Leader %s append entry %d (Term %d) to its own local log\n", rn.id, index, term)
+
+	return true, index
 }
