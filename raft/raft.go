@@ -18,8 +18,12 @@ const (
 )
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderID string
+	Term         int
+	LeaderID     string
+	prevLogIndex int
+	prevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -56,9 +60,13 @@ type RaftNode struct {
 	votedFor    string // candidate id that received vote in current term
 	log         []LogEntry
 
-	resetTimer chan struct{} // channels for signaling
+	// volatile
+	commitIndex int            // index of highest log to be commited
+	lastApplied int            // index of highest log to be applied to Store
+	nextIndex   map[string]int // for each ppeer index of the next log entry to send
+	matchIndex  map[string]int // for each peer index of highest log entry to be replicated
 
-	// TODO: nextIndex, matchIndex
+	resetTimer chan struct{} // channels for signalin
 }
 
 func NewRaftNode(id string, peers []string) *RaftNode {
@@ -197,6 +205,16 @@ func (rn *RaftNode) becomeLeader() {
 	rn.state = LEADER
 	fmt.Printf("Node %s WON THE ELECTION! Now Leader for Term %d\n", rn.id, rn.currentTerm)
 
+	rn.nextIndex = make(map[string]int)
+	rn.matchIndex = make(map[string]int)
+
+	// raft rule: nextIndex is initialised to leaders last log index + 1
+	lastLogIndex := len(rn.log)
+
+	for _, peer := range rn.peers {
+		rn.nextIndex[peer] = lastLogIndex + 1
+		rn.matchIndex[peer] = 0
+	}
 	go rn.sendHeartbeats()
 }
 
