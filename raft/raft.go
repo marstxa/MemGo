@@ -318,8 +318,33 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 	default:
 	}
 
-	// TODO: add log later here
+	// handle log entries
 
+	if args.PrevLogIndex > len(rn.log)-1 {
+		return nil
+	}
+
+	if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return nil
+	}
+
+	// if we reach here that means the logs match
+	// we trucate our lugs to remove any uncommited trash from old leaders
+	rn.log = rn.log[:args.PrevLogIndex+1]
+	rn.log = append(rn.log, args.Entries...)
+
+	// update commit index
+	if args.LeaderCommit > rn.commitIndex {
+		lastNewEntryIndex := len(rn.log) - 1
+
+		if args.LeaderCommit < lastNewEntryIndex {
+			rn.commitIndex = args.LeaderCommit
+		} else {
+			rn.commitIndex = lastNewEntryIndex
+		}
+
+		fmt.Printf("Node %s advance commitIndex to %d\n", rn.id, rn.commitIndex)
+	}
 	reply.Success = true
 	return nil
 }
