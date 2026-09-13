@@ -193,6 +193,7 @@ func (rn *RaftNode) requestVotes(term int) {
 						rn.becomeLeader()
 					}
 				}
+
 			}
 		}(peer)
 	}
@@ -251,6 +252,16 @@ func (rn *RaftNode) becomeLeader() {
 		rn.matchIndex[peer] = 0
 	}
 	go rn.sendHeartbeats()
+
+	// raft "no-op" force commitIndex to advance on reboot
+	go func() {
+		// give 50ms to establish heartbeats
+		time.Sleep(50 * time.Millisecond)
+
+		// submit raw RESP "PING" command
+		// this forces a new log entry in the current term, unlocking backlogging
+		rn.Submit([]byte("*1\r\n$4\r\nPING\r\n"))
+	}()
 }
 
 func (rn *RaftNode) stepDown(newTerm int) {
