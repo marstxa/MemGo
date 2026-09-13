@@ -20,9 +20,12 @@ const (
 )
 
 type PersistanceState struct {
-	CurrentTerm int
-	VotedFor    string
-	Log         []LogEntry
+	CurrentTerm       int
+	VotedFor          string
+	Snapshot          []byte // the actual kv map serialised JSON
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Log               []LogEntry // only hold entires AFTER the LastIncludedIndex
 }
 
 type AppendEntriesArgs struct {
@@ -566,3 +569,8 @@ func (rn *RaftNode) restore() {
 
 	fmt.Printf("Node %s restored from disk! Term %d, Log Lenght: %d\n", rn.id, rn.currentTerm, len(rn.log))
 }
+
+// TODO: implement
+// func (rn *RaftNode) getRealIndex(raftIndex int) int {
+// 	return raftIndex - rn.LastIncludedIndex
+// }

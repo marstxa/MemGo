@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -22,6 +23,34 @@ func New() *Store {
 		data:   make(map[string]CacheEntry),
 		hashes: make(map[string]map[string]CacheEntry),
 	}
+}
+
+func (s *Store) ExportSnapshot() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// convert to JSON bytes
+	snapshotBytes, err := json.Marshal(s.data)
+	if err != nil {
+		return nil, err
+	}
+
+	return snapshotBytes, nil
+}
+
+func (s *Store) RestoreSnapshot(snapshotBytes []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var restoredData map[string]CacheEntry
+	err := json.Unmarshal(snapshotBytes, &restoredData)
+	if err != nil {
+		return nil
+	}
+
+	// replace the old data with the snapshot
+	s.data = restoredData
+	return nil
 }
 
 func (s *Store) Set(key, value string, exp time.Time) {
