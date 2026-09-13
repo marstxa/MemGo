@@ -1,204 +1,133 @@
 package main
 
-// import (
-// 	"bytes"
-// 	"flag"
-// 	"fmt"
-// 	"net"
-// 	"strings"
-
-// 	"github.com/marstxa/aof"
-// 	"github.com/marstxa/handler"
-// 	"github.com/marstxa/replication"
-// 	"github.com/marstxa/resp"
-// 	"github.com/marstxa/store"
-// )
-
-// func main() {
-// 	port := flag.Int("port", 6379, "TCP port to listen on")
-// 	replicaof := flag.String("replicaof", "", "Address of the leader (e.g., 'localhost:6379')")
-// 	flag.Parse()
-
-// 	// initialise store and handler
-// 	s := store.New()
-// 	h := handler.New(s)
-
-// 	// data persistence with aof
-// 	aofFile, err := aof.NewAof("database.aof")
-
-// 	if err != nil {
-// 		fmt.Println("Failed to create AOF: ", err)
-// 		return
-// 	}
-
-// 	defer aofFile.Close()
-
-// 	aofFile.Read(func(value resp.Value) {
-// 		command := strings.ToUpper(value.Array[0].Bulk)
-// 		args := value.Array[1:]
-
-// 		commandFunc, ok := h.Handlers[command]
-// 		if !ok {
-// 			fmt.Println("Invalid command in AOF: ", command)
-// 			return
-// 		}
-
-// 		commandFunc(args)
-// 	})
-
-// 	var leaderReplicator *replication.LeaderReplicator
-
-// 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
-// 	fmt.Println("Listening for clients on", addr)
-
-// 	// initialise roles based on flags
-// 	if *replicaof != "" {
-// 		fmt.Println("Starting as a FOLLOWER.\nReplicating from:", *replicaof)
-
-// 		follower := replication.NewFollowerReplicator(s, aofFile, h)
-// 		err := follower.Connect(*replicaof)
-
-// 		if err != nil {
-// 			fmt.Println("Follower failed to connect immediately, will rely on reconnect loop:", err)
-// 		}
-
-// 		// listen to leader in the bg
-// 		go follower.ReceiveLoop()
-// 	} else {
-// 		fmt.Println("Starting as a LEADER.")
-
-// 		leaderReplicator = replication.NewLeaderReplicator(s, aofFile)
-
-// 		// open dedicated port for followers
-// 		replPort := fmt.Sprintf("0.0.0.0:%d", *port+1000)
-// 		fmt.Println("Listening for followers on", replPort)
-
-// 		err := leaderReplicator.Listen(replPort)
-// 		if err != nil {
-// 			fmt.Println("Failed to start replication server:", err)
-// 			return
-// 		}
-// 	}
-
-// 	// create new server
-// 	l, err := net.Listen("tcp", addr)
-// 	if err != nil {
-// 		fmt.Println(err)
-// 		return
-// 	}
-
-// 	// listen for connections
-
-// 	for {
-// 		conn, err := l.Accept()
-// 		if err != nil {
-// 			fmt.Println("Error accepting connection: ", err.Error())
-// 			continue
-// 		}
-// 		// pass the leaderReplicator down
-// 		go handleConn(conn, aofFile, h, leaderReplicator)
-// 	}
-
-// }
-
-// func handleConn(conn net.Conn, aofFile *aof.Aof, h *handler.Handler, leader *replication.LeaderReplicator) {
-// 	defer conn.Close()
-
-// 	for {
-// 		// initialise parser by wrapping the connection
-// 		parser := resp.NewResp(conn)
-
-// 		// attempt to parse a full RESP value
-// 		value, err := parser.Read()
-// 		if err != nil {
-// 			fmt.Println(err)
-// 			return
-// 		}
-
-// 		if value.Typ != "array" {
-// 			fmt.Println("Invalid request, expected array")
-// 			continue
-// 		}
-
-// 		if len(value.Array) == 0 {
-// 			fmt.Println("Invaliid request, expected array length > 0")
-// 			continue
-// 		}
-
-// 		command := strings.ToUpper(value.Array[0].Bulk)
-// 		args := value.Array[1:]
-
-// 		writer := resp.NewWriter(conn)
-
-// 		commandFunc, ok := h.Handlers[command]
-
-// 		if !ok {
-// 			fmt.Println("Invalid command ", command)
-// 			writer.Write(resp.Value{Typ: "error", Str: "ERR unknown command"})
-// 			continue
-// 		}
-// 		isWrite := command == "SET" || command == "HSET" || command == "DEL" || command == "HDEL"
-
-// 		// Write mutations to the AOF file before executing
-// 		if isWrite {
-// 			// if leader is nil, server is a follower making it READ-ONLY
-// 			if leader == nil {
-// 				writer.Write(resp.Value{Typ: "error", Str: "READONLY You can't write against a read only replica"})
-// 				continue
-// 			}
-
-// 			aofFile.Write(value)
-
-// 			// Convert back to raw RESP
-// 			var buf bytes.Buffer
-// 			tempWriter := resp.NewWriter(&buf)
-// 			tempWriter.Write(value)
-
-// 			leader.Propagate(buf.Bytes())
-// 		}
-
-// 		// Execute
-// 		result := commandFunc(args)
-// 		writer.Write(result)
-
-// 	}
-// }
-
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"net"
 	"strings"
 
+	"github.com/marstxa/handler"
 	"github.com/marstxa/raft"
+	"github.com/marstxa/resp"
+	"github.com/marstxa/store"
 )
 
 func main() {
-	// E.g., --id localhost:6001
-	id := flag.String("id", "", "This node's address")
-	// E.g., --peers localhost:6002,localhost:6003
-	peersFlag := flag.String("peers", "", "Comma-separated list of peer addresses")
-	flag.Parse()
+	port := flag.Int("port", 6379, "TCP port to listen on for clients")
+	id := flag.String("id", "", "This node's Raft address (e.g. localhost:6001)")
+	peersFlag := flag.String("peers", "", "Comman-separated list of peer Raft addresses")
 
-	if *id == "" {
-		fmt.Println("Please provide an --id")
-		return
-	}
+	flag.Parse()
 
 	var peers []string
 	if *peersFlag != "" {
 		peers = strings.Split(*peersFlag, ",")
 	}
 
-	// initialise node
-	node := raft.NewRaftNode(*id, peers)
+	// initialise redis and handler
+	s := store.New()
+	h := handler.New(s)
 
-	// start its RPC server so others can talk to it
-	err := node.StartServer()
+	// initialise raft consensus engine
+	applyCh := make(chan []byte, 100)
+	raftNode := raft.NewRaftNode(*id, peers, applyCh)
+
+	err := raftNode.StartServer()
 	if err != nil {
-		fmt.Println("Failed to start server:", err)
+		fmt.Println("Failed to start Raft server:", err)
 		return
 	}
 
-	// keep the main thread alive forever
-	select {}
+	go runStateMachine(applyCh, h)
+
+	// listening
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
+	fmt.Println("Listening for Redis clients on", addr)
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			continue
+		}
+
+		go handleConn(conn, h, raftNode)
+
+	}
+}
+
+// listens for commited log entries and applies them to the Redis
+func runStateMachine(applyCh chan []byte, h *handler.Handler) {
+	for cmdBytes := range applyCh {
+		// wrap the raw bytes in a reader so our RESP parser can read it
+		parser := resp.NewResp(bytes.NewReader(cmdBytes))
+
+		value, err := parser.Read()
+		if err != nil {
+			fmt.Println("Error parsing commited command:", err)
+			continue
+		}
+
+		command := strings.ToUpper(value.Array[0].Bulk)
+		args := value.Array[1:]
+
+		if commandFunc, ok := h.Handlers[command]; ok {
+			// apply to store
+			commandFunc(args)
+			fmt.Printf("State machine applied %s command succesfully.\n", command)
+		}
+	}
+}
+
+func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode) {
+	defer conn.Close()
+
+	for {
+		parser := resp.NewResp(conn)
+		value, err := parser.Read()
+		if err != nil {
+			return
+		}
+
+		command := strings.ToUpper(value.Array[0].Bulk)
+		args := value.Array[1:]
+		writer := resp.NewWriter(conn)
+
+		commandFunc, ok := h.Handlers[command]
+
+		if !ok {
+			writer.Write(resp.Value{Typ: "error", Str: "ERR unknown command"})
+			continue
+		}
+
+		isWrite := command == "SET" || command == "HSET" || command == "DEL" || command == "HDEL"
+
+		if isWrite {
+			// convert to raw bytes
+			var buf bytes.Buffer
+			tempWriter := resp.NewWriter(&buf)
+			tempWriter.Write(value)
+
+			// submit to raft
+			isLeader, _ := rn.Submit(buf.Bytes())
+
+			if !isLeader {
+				// reject the write
+				writer.Write(resp.Value{Typ: "error", Str: "ERR I am not the Leader Node"})
+				continue
+			}
+
+			// For now reply OK immediately
+			writer.Write(resp.Value{Typ: "string", Str: "OK"})
+			continue
+		}
+
+		result := commandFunc(args)
+		writer.Write(result)
+	}
 }

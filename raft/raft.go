@@ -231,7 +231,7 @@ func (rn *RaftNode) becomeLeader() {
 	rn.matchIndex = make(map[string]int)
 
 	// raft rule: nextIndex is initialised to leaders last log index + 1
-	lastLogIndex := len(rn.log)
+	lastLogIndex := len(rn.log) - 1
 
 	for _, peer := range rn.peers {
 		rn.nextIndex[peer] = lastLogIndex + 1
@@ -266,18 +266,32 @@ func (rn *RaftNode) sendHeartbeats() {
 				rn.mu.Lock()
 
 				nextIdx := rn.nextIndex[peerAddr]
+
+				if nextIdx < 1 {
+					nextIdx = 1
+					rn.nextIndex[peerAddr] = 1
+				}
+
+				if nextIdx > len(rn.log) {
+					nextIdx = len(rn.log)
+					rn.nextIndex[peerAddr] = nextIdx
+				}
+
 				prevLogIndex := nextIdx - 1
 				prevLogTerm := rn.log[prevLogIndex].Term
 
 				// gra and make a copy of all entries from nextIdx to the end of the log
-				entries := make([]LogEntry, len(rn.log[nextIdx:]))
-				copy(entries, rn.log[nextIdx:])
+				var entries []LogEntry
+				if nextIdx < len(rn.log) {
+					entries = make([]LogEntry, len(rn.log)-nextIdx)
+					copy(entries, rn.log[nextIdx:])
+				}
 				rn.mu.Unlock()
 
 				args := AppendEntriesArgs{
 					Term:         term,
 					LeaderID:     leaderID,
-					PrevLogIndex: prevLogTerm,
+					PrevLogIndex: prevLogIndex,
 					PrevLogTerm:  prevLogTerm,
 					Entries:      entries,
 					LeaderCommit: leaderCommit,
@@ -291,6 +305,7 @@ func (rn *RaftNode) sendHeartbeats() {
 
 					if reply.Term > rn.currentTerm {
 						rn.stepDown(reply.Term)
+						return
 					}
 
 					// ONLY process reply if we are still the leader
@@ -302,7 +317,9 @@ func (rn *RaftNode) sendHeartbeats() {
 							rn.advanceCommitIndex()
 						} else {
 							// decrement index so we send older data to next heartbeat
-							rn.nextIndex[peerAddr]--
+							if rn.nextIndex[peerAddr] > 1 {
+								rn.nextIndex[peerAddr]--
+							}
 							fmt.Printf("Follower %s rejected log; backtracking nextIndex to %d\n", peerAddr, rn.nextIndex[peerAddr])
 						}
 					}
@@ -462,7 +479,7 @@ func (rn *RaftNode) advanceCommitIndex() {
 		}
 
 		if count >= majority {
-			rn.currentTerm = n
+			rn.commitIndex = n
 			fmt.Printf("Leader %s advanced commitIndex to %d (Data is now safe)", rn.id, rn.commitIndex)
 
 			rn.applyCommited()
