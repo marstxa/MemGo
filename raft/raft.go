@@ -279,6 +279,8 @@ func (rn *RaftNode) sendHeartbeats() {
 						if reply.Success {
 							rn.nextIndex[peerAddr] = nextIdx + len(entries)
 							rn.matchIndex[peerAddr] = rn.nextIndex[peerAddr] - 1
+
+							rn.advanceCommitIndex()
 						} else {
 							// decrement index so we send older data to next heartbeat
 							rn.nextIndex[peerAddr]--
@@ -417,4 +419,33 @@ func (rn *RaftNode) Submit(command []byte) (bool, int) {
 	fmt.Printf("Leader %s append entry %d (Term %d) to its own local log\n", rn.id, index, term)
 
 	return true, index
+}
+
+// checks if the majority of followers have replicated a log entry
+// and if so, safely updates the leader's commit index
+// MUST be called while rn.mu is locked!
+func (rn *RaftNode) advanceCommitIndex() {
+	majority := (len(rn.peers)+1)/2 + 1
+
+	// start from newest entry going backwards down to current commitIndex
+	for n := len(rn.log) - 1; n > rn.commitIndex; n-- {
+
+		if rn.log[n].Term != rn.currentTerm {
+			continue
+		}
+
+		count := 1 // servers that have this entry
+		for _, peer := range rn.peers {
+			if rn.matchIndex[peer] >= n {
+				count++
+			}
+		}
+
+		if count >= majority {
+			rn.currentTerm = n
+			fmt.Printf("Leader %s advanced commitIndex to %d (Data is now safe)", rn.id, rn.commitIndex)
+			break
+		}
+
+	}
 }
