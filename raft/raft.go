@@ -1,10 +1,12 @@
 package raft
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
@@ -16,6 +18,12 @@ const (
 	CANDIDATE
 	LEADER
 )
+
+type PersistanceState struct {
+	CurrentTerm int
+	VotedFor    string
+	Log         []LogEntry
+}
 
 type AppendEntriesArgs struct {
 	Term         int
@@ -81,6 +89,10 @@ func NewRaftNode(id string, peers []string, ch chan []byte) *RaftNode {
 		resetTimer: make(chan struct{}, 1),
 		ApplyCh:    ch,
 	}
+
+	// load state from disk before starting
+	rn.restore()
+
 	// start election VIVA LA DEMOCRACIA
 	go rn.runElectionTimer()
 
@@ -132,8 +144,8 @@ func (rn *RaftNode) StartElection() {
 
 	rn.state = CANDIDATE
 	rn.currentTerm++
-
 	rn.votedFor = rn.id
+	rn.persist()
 	currentTerm := rn.currentTerm
 
 	fmt.Printf("Node %s starting election for Term %d\n", rn.id, rn.currentTerm)
@@ -208,6 +220,7 @@ func (rn *RaftNode) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) e
 	if rn.votedFor == "" || rn.votedFor == args.CandidateID {
 
 		rn.votedFor = args.CandidateID
+		rn.persist()
 		reply.VoteGranted = true
 
 		// MUST reset election timer after we make a vote, so we dont start our own competing election
@@ -244,6 +257,7 @@ func (rn *RaftNode) stepDown(newTerm int) {
 	rn.currentTerm = newTerm
 	rn.state = FOLLOWER
 	rn.votedFor = ""
+	rn.persist()
 	fmt.Printf("Node %s stepping down to Follower for Term %d\n", rn.id, newTerm)
 }
 
@@ -370,6 +384,7 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 	// we trucate our lugs to remove any uncommited trash from old leaders
 	rn.log = rn.log[:args.PrevLogIndex+1]
 	rn.log = append(rn.log, args.Entries...)
+	rn.persist()
 
 	// update commit index
 	if args.LeaderCommit > rn.commitIndex {
@@ -452,6 +467,7 @@ func (rn *RaftNode) Submit(command []byte) (bool, int) {
 
 	// append own log
 	rn.log = append(rn.log, entry)
+	rn.persist()
 
 	fmt.Printf("Leader %s append entry %d (Term %d) to its own local log\n", rn.id, index, term)
 
@@ -488,4 +504,54 @@ func (rn *RaftNode) advanceCommitIndex() {
 		}
 
 	}
+}
+
+// persist saves the node critical state to the disk
+func (rn *RaftNode) persist() {
+	state := PersistanceState{
+		CurrentTerm: rn.currentTerm,
+		VotedFor:    rn.votedFor,
+		Log:         rn.log,
+	}
+
+	// convert the state to a JSON byte slice
+	data, err := json.Marshal(state)
+	if err != nil {
+		fmt.Printf("Failed to marshal state for persistance: %v\n", err)
+		return
+	}
+
+	filename := fmt.Sprintf("raft-state-%s.json", rn.id)
+
+	// write to disk
+	err = os.WriteFile(filename, data, 0644)
+	if err != nil {
+		fmt.Printf("Failed to write state to disk: %v\n", err)
+		return
+	}
+}
+
+// restore loads the state frmom disk when the server boots
+func (rn *RaftNode) restore() {
+	filename := fmt.Sprintf("raft-state-%s.json", rn.id)
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		// brand new server
+		return
+	}
+
+	var state PersistanceState
+	err = json.Unmarshal(data, &state)
+	if err != nil {
+		fmt.Printf("Failed to unmarshal restored state: %v\n", err)
+		return
+	}
+
+	// restore critical variables
+	rn.currentTerm = state.CurrentTerm
+	rn.votedFor = state.VotedFor
+	rn.log = state.Log
+
+	fmt.Printf("Node %s restored from disk! Term %d, Log Lenght: %d\n", rn.id, rn.currentTerm, len(rn.log))
 }
