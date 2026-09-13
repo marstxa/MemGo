@@ -67,23 +67,42 @@ type RaftNode struct {
 	matchIndex  map[string]int // for each peer index of highest log entry to be replicated
 
 	resetTimer chan struct{} // channels for signalin
+
+	ApplyCh chan []byte // use to send committed commands to main application
 }
 
-func NewRaftNode(id string, peers []string) *RaftNode {
+func NewRaftNode(id string, peers []string, ch chan []byte) *RaftNode {
 	rn := &RaftNode{
-		id:       id,
-		peers:    peers,
-		state:    FOLLOWER,
-		votedFor: "",
-
-		// dummy
+		id:         id,
+		peers:      peers,
+		state:      FOLLOWER,
+		votedFor:   "",
 		log:        []LogEntry{{Index: 0, Term: 0}},
 		resetTimer: make(chan struct{}, 1),
+		ApplyCh:    ch,
 	}
 	// start election VIVA LA DEMOCRACIA
 	go rn.runElectionTimer()
 
 	return rn
+}
+
+func (rn *RaftNode) applyCommited() {
+	var entriesToApply []LogEntry
+
+	for rn.lastApplied < rn.commitIndex {
+		rn.lastApplied++
+		entriesToApply = append(entriesToApply, rn.log[rn.lastApplied])
+	}
+
+	if len(entriesToApply) > 0 {
+		go func(entries []LogEntry) {
+			for _, entry := range entries {
+				// Ships the raw RESP bytes out of the Raft Engine
+				rn.ApplyCh <- entry.Command
+			}
+		}(entriesToApply)
+	}
 }
 
 func (rn *RaftNode) runElectionTimer() {
@@ -346,6 +365,7 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 		}
 
 		fmt.Printf("Node %s advance commitIndex to %d\n", rn.id, rn.commitIndex)
+		rn.applyCommited()
 	}
 	reply.Success = true
 	return nil
@@ -444,6 +464,9 @@ func (rn *RaftNode) advanceCommitIndex() {
 		if count >= majority {
 			rn.currentTerm = n
 			fmt.Printf("Leader %s advanced commitIndex to %d (Data is now safe)", rn.id, rn.commitIndex)
+
+			rn.applyCommited()
+
 			break
 		}
 
