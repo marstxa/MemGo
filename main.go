@@ -30,7 +30,7 @@ func main() {
 	h := handler.New(s)
 
 	// initialise raft consensus engine
-	applyCh := make(chan []byte, 100)
+	applyCh := make(chan raft.ApplyMsg, 100)
 	raftNode := raft.NewRaftNode(*id, peers, applyCh)
 
 	err := raftNode.StartServer()
@@ -62,24 +62,33 @@ func main() {
 }
 
 // listens for commited log entries and applies them to the Redis
-func runStateMachine(applyCh chan []byte, h *handler.Handler) {
-	for cmdBytes := range applyCh {
-		// wrap the raw bytes in a reader so our RESP parser can read it
-		parser := resp.NewResp(bytes.NewReader(cmdBytes))
-
-		value, err := parser.Read()
-		if err != nil {
-			fmt.Println("Error parsing commited command:", err)
+func runStateMachine(applyCh chan raft.ApplyMsg, h *handler.Handler, s *store.Store) {
+	for msg := range applyCh {
+		if msg.SnapshotValid {
+			err := s.RestoreSnapshot(msg.Snapshot)
+			if err != nil {
+				fmt.Printf("Failed to apply snapshot: %v\n", err)
+				continue
+			}
+			fmt.Printf("State machine restored at index %d\n", msg.SnapshotIndex)
 			continue
 		}
 
-		command := strings.ToUpper(value.Array[0].Bulk)
-		args := value.Array[1:]
+		if msg.CommandValid {
+			parser := resp.NewResp(bytes.NewReader(msg.Command))
+			value, err := parser.Read()
+			if err != nil {
+				fmt.Println("Error parsing commited command:", err)
+				continue
+			}
 
-		if commandFunc, ok := h.Handlers[command]; ok {
-			// apply to store
-			commandFunc(args)
-			fmt.Printf("State machine applied %s command succesfully.\n", command)
+			command := strings.ToUpper(value.Array[0].Bulk)
+			args := value.Array[1:]
+
+			if commandFunc, ok := h.Handlers[command]; ok {
+				commandFunc(args)
+				fmt.Printf("State machine applied %s command successfully.\n", commandFunc)
+			}
 		}
 	}
 }

@@ -19,13 +19,38 @@ const (
 	LEADER
 )
 
+type InstallSnaphotArgs struct {
+	Term              int
+	LeaderID          string
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnaphotReply struct {
+	Term int
+}
+
+type ApplyMsg struct {
+	CommandValid bool
+	Command      []byte
+	CommandIndex int
+
+	// Snapshot delivery
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
+}
+
 type PersistanceState struct {
-	CurrentTerm       int
-	VotedFor          string
+	CurrentTerm int
+	VotedFor    string
+	Log         []LogEntry // only hold entires AFTER the LastIncludedIndex
+
 	Snapshot          []byte // the actual kv map serialised JSON
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	Log               []LogEntry // only hold entires AFTER the LastIncludedIndex
 }
 
 type AppendEntriesArgs struct {
@@ -45,7 +70,6 @@ type AppendEntriesReply struct {
 type RequestVoteArgs struct {
 	Term        int
 	CandidateID string
-	// TODO: LastLogIndex, LastLogTerm
 }
 
 type RequestVoteReply struct {
@@ -71,6 +95,11 @@ type RaftNode struct {
 	votedFor    string // candidate id that received vote in current term
 	log         []LogEntry
 
+	// snapshot state
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	snapshot          []byte // keep a copy in memory so persist() can access it
+
 	// volatile
 	commitIndex int            // index of highest log to be commited
 	lastApplied int            // index of highest log to be applied to Store
@@ -79,10 +108,10 @@ type RaftNode struct {
 
 	resetTimer chan struct{} // channels for signalin
 
-	ApplyCh chan []byte // use to send committed commands to main application
+	ApplyCh chan ApplyMsg // use to send committed commands to main application
 }
 
-func NewRaftNode(id string, peers []string, ch chan []byte) *RaftNode {
+func NewRaftNode(id string, peers []string, ch chan ApplyMsg) *RaftNode {
 	rn := &RaftNode{
 		id:         id,
 		peers:      peers,
@@ -103,20 +132,24 @@ func NewRaftNode(id string, peers []string, ch chan []byte) *RaftNode {
 }
 
 func (rn *RaftNode) applyCommited() {
-	var entriesToApply []LogEntry
+	var msgs []ApplyMsg
 
 	for rn.lastApplied < rn.commitIndex {
 		rn.lastApplied++
-		entriesToApply = append(entriesToApply, rn.log[rn.lastApplied])
+		realIndex := rn.getRealIndex(rn.lastApplied)
+		msgs = append(msgs, ApplyMsg{
+			CommandValid: true,
+			Command:      rn.log[realIndex].Command,
+			CommandIndex: rn.lastApplied,
+		})
 	}
 
-	if len(entriesToApply) > 0 {
-		go func(entries []LogEntry) {
-			for _, entry := range entries {
-				// Ships the raw RESP bytes out of the Raft Engine
-				rn.ApplyCh <- entry.Command
+	if len(msgs) > 0 {
+		go func(toSend []ApplyMsg) {
+			for _, msg := range msgs {
+				rn.ApplyCh <- msg
 			}
-		}(entriesToApply)
+		}(msgs)
 	}
 }
 
@@ -248,7 +281,7 @@ func (rn *RaftNode) becomeLeader() {
 	rn.matchIndex = make(map[string]int)
 
 	// raft rule: nextIndex is initialised to leaders last log index + 1
-	lastLogIndex := len(rn.log) - 1
+	lastLogIndex := rn.getLastLogIndex()
 
 	for _, peer := range rn.peers {
 		rn.nextIndex[peer] = lastLogIndex + 1
@@ -294,26 +327,61 @@ func (rn *RaftNode) sendHeartbeats() {
 				rn.mu.Lock()
 
 				nextIdx := rn.nextIndex[peerAddr]
+				lastLogIndex := rn.getLastLogIndex()
 
-				if nextIdx < 1 {
-					nextIdx = 1
-					rn.nextIndex[peerAddr] = 1
+				// if the follower is so far behind we already deleted the logs they need...
+				if nextIdx <= rn.LastIncludedIndex {
+					args := InstallSnaphotArgs{
+						Term:              term,
+						LeaderID:          leaderID,
+						LastIncludedIndex: rn.LastIncludedIndex,
+						LastIncludedTerm:  rn.LastIncludedTerm,
+						Data:              rn.snapshot,
+					}
+					rn.mu.Unlock()
+
+					go func(targetPeer string, snapArgs InstallSnaphotArgs) {
+						var reply InstallSnaphotReply
+						err := rn.sendRPC(targetPeer, "RaftNode.InstallSnapshot", snapArgs, &reply)
+
+						if err == nil {
+							rn.mu.Lock()
+							defer rn.mu.Unlock()
+
+							if reply.Term > rn.currentTerm {
+								rn.stepDown(reply.Term)
+								return
+							}
+
+							if rn.state == LEADER && rn.currentTerm == snapArgs.Term {
+								rn.nextIndex[targetPeer] = snapArgs.LastIncludedIndex + 1
+								rn.matchIndex[targetPeer] = snapArgs.LastIncludedIndex
+							}
+						}
+					}(peerAddr, args)
+
+					return
 				}
 
-				if nextIdx > len(rn.log) {
-					nextIdx = len(rn.log)
+				// guard rails using global index
+				if nextIdx > lastLogIndex+1 {
+					nextIdx = lastLogIndex + 1
 					rn.nextIndex[peerAddr] = nextIdx
 				}
 
 				prevLogIndex := nextIdx - 1
-				prevLogTerm := rn.log[prevLogIndex].Term
 
-				// gra and make a copy of all entries from nextIdx to the end of the log
+				// translate array index before accessing rn.log
+				realPrevIndex := rn.getRealIndex(prevLogIndex)
+				prevLogTerm := rn.log[realPrevIndex].Term
+
 				var entries []LogEntry
-				if nextIdx < len(rn.log) {
-					entries = make([]LogEntry, len(rn.log)-nextIdx)
-					copy(entries, rn.log[nextIdx:])
+				if nextIdx <= lastLogIndex {
+					realNextIndex := rn.getRealIndex(nextIdx)
+					entries = make([]LogEntry, len(rn.log)-realNextIndex)
+					copy(entries, rn.log[realNextIndex:])
 				}
+
 				rn.mu.Unlock()
 
 				args := AppendEntriesArgs{
@@ -341,11 +409,10 @@ func (rn *RaftNode) sendHeartbeats() {
 						if reply.Success {
 							rn.nextIndex[peerAddr] = nextIdx + len(entries)
 							rn.matchIndex[peerAddr] = rn.nextIndex[peerAddr] - 1
-
 							rn.advanceCommitIndex()
 						} else {
 							// decrement index so we send older data to next heartbeat
-							if rn.nextIndex[peerAddr] > 1 {
+							if rn.nextIndex[peerAddr] > rn.LastIncludedIndex+1 {
 								rn.nextIndex[peerAddr]--
 							}
 							fmt.Printf("Follower %s rejected log; backtracking nextIndex to %d\n", peerAddr, rn.nextIndex[peerAddr])
@@ -385,24 +452,32 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 	}
 
 	// handle log entries
+	lastLogIndex := rn.getLastLogIndex()
 
-	if args.PrevLogIndex > len(rn.log)-1 {
+	if args.PrevLogIndex < rn.LastIncludedIndex {
 		return nil
 	}
 
-	if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > lastLogIndex {
+		return nil
+	}
+
+	// translate array before checking term
+	realPrevIndex := rn.getRealIndex(args.PrevLogIndex)
+
+	if rn.log[realPrevIndex].Term != args.PrevLogTerm {
 		return nil
 	}
 
 	// if we reach here that means the logs match
 	// we trucate our lugs to remove any uncommited trash from old leaders
-	rn.log = rn.log[:args.PrevLogIndex+1]
+	rn.log = rn.log[:realPrevIndex+1]
 	rn.log = append(rn.log, args.Entries...)
 	rn.persist()
 
 	// update commit index
 	if args.LeaderCommit > rn.commitIndex {
-		lastNewEntryIndex := len(rn.log) - 1
+		lastNewEntryIndex := rn.getLastLogIndex()
 
 		if args.LeaderCommit < lastNewEntryIndex {
 			rn.commitIndex = args.LeaderCommit
@@ -470,7 +545,7 @@ func (rn *RaftNode) Submit(command []byte) (bool, int) {
 		return false, -1
 	}
 
-	index := len(rn.log)
+	index := rn.getLastLogIndex() + 1
 	term := rn.currentTerm
 
 	entry := LogEntry{
@@ -496,8 +571,8 @@ func (rn *RaftNode) advanceCommitIndex() {
 
 	// start from newest entry going backwards down to current commitIndex
 	for n := len(rn.log) - 1; n > rn.commitIndex; n-- {
-
-		if rn.log[n].Term != rn.currentTerm {
+		realN := rn.getRealIndex(n)
+		if rn.log[realN].Term != rn.currentTerm {
 			continue
 		}
 
@@ -523,9 +598,12 @@ func (rn *RaftNode) advanceCommitIndex() {
 // persist saves the node critical state to the disk
 func (rn *RaftNode) persist() {
 	state := PersistanceState{
-		CurrentTerm: rn.currentTerm,
-		VotedFor:    rn.votedFor,
-		Log:         rn.log,
+		CurrentTerm:       rn.currentTerm,
+		VotedFor:          rn.votedFor,
+		Log:               rn.log,
+		Snapshot:          rn.snapshot,
+		LastIncludedIndex: rn.LastIncludedIndex,
+		LastIncludedTerm:  rn.LastIncludedTerm,
 	}
 
 	// convert the state to a JSON byte slice
@@ -566,11 +644,129 @@ func (rn *RaftNode) restore() {
 	rn.currentTerm = state.CurrentTerm
 	rn.votedFor = state.VotedFor
 	rn.log = state.Log
+	rn.snapshot = state.Snapshot
+	rn.LastIncludedIndex = state.LastIncludedIndex
+	rn.LastIncludedTerm = state.LastIncludedTerm
+
+	// catch up volatile pointers to snapshot
+	rn.lastApplied = rn.LastIncludedIndex
+	rn.commitIndex = rn.LastIncludedIndex
 
 	fmt.Printf("Node %s restored from disk! Term %d, Log Lenght: %d\n", rn.id, rn.currentTerm, len(rn.log))
 }
 
-// TODO: implement
-// func (rn *RaftNode) getRealIndex(raftIndex int) int {
-// 	return raftIndex - rn.LastIncludedIndex
-// }
+// converts a global raft log index into the local array index
+func (rn *RaftNode) getRealIndex(raftIndex int) int {
+	return raftIndex - rn.LastIncludedIndex
+}
+
+// offset to retrieve data
+func (rn *RaftNode) getLastLogIndex() int {
+	return rn.LastIncludedIndex + len(rn.log) - 1
+}
+
+// called by the application to compress the Raft log
+func (rn *RaftNode) Snapshot(snapshotIndex int, snapshotBytes []byte) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// reject if old or already compressed
+	if snapshotIndex < rn.LastIncludedIndex {
+		return
+	}
+
+	realIndex := rn.getRealIndex(snapshotIndex)
+
+	rn.LastIncludedTerm = rn.log[realIndex].Term
+	rn.LastIncludedIndex = snapshotIndex
+	rn.snapshot = snapshotBytes
+
+	// CHOP THE LOG WITH AN AXE!
+	// create a new slice, index 0 becomes a dummy
+	// entry holding the snapshot metadata {Index: 0, Term: 0}
+	newLog := make([]LogEntry, 1)
+	newLog[0] = LogEntry{Index: snapshotIndex, Term: rn.LastIncludedTerm}
+
+	// append what entries came after the snapshot
+	newLog = append(newLog, rn.log[realIndex+1:]...)
+	rn.log = newLog
+
+	// save to disk
+	rn.persist()
+
+	fmt.Printf("Node %s created snapshot at index %d! Log compressed to %d entries.\n", rn.id, snapshotIndex, len(rn.log))
+
+}
+
+func (rn *RaftNode) InstallSnaphot(args InstallSnaphotArgs, reply *InstallSnaphotReply) error {
+	rn.mu.Lock()
+	reply.Term = rn.currentTerm
+
+	if args.Term < rn.currentTerm {
+		rn.mu.Unlock()
+		return nil
+	}
+
+	if args.Term > rn.currentTerm || rn.state == CANDIDATE {
+		rn.stepDown(args.Term)
+		reply.Term = rn.currentTerm
+	}
+
+	// reset election timer
+	select {
+	case rn.resetTimer <- struct{}{}:
+	default:
+	}
+
+	// if we already have a newer or equal snapshot disregard this one
+	if args.LastIncludedIndex <= rn.LastIncludedIndex {
+		rn.mu.Unlock()
+		return nil
+	}
+
+	// retain entries that come after the snapshot index if term matches
+	var newLog []LogEntry
+	newLog = append(newLog, LogEntry{
+		Index: args.LastIncludedIndex,
+		Term:  args.LastIncludedTerm,
+	})
+
+	if args.LastIncludedIndex < rn.getLastLogIndex() {
+		realIdx := rn.getRealIndex(args.LastIncludedIndex)
+		if realIdx > 0 && realIdx < len(rn.log) && rn.log[realIdx].Term == args.LastIncludedTerm {
+			newLog = append(newLog, rn.log[realIdx+1:]...)
+		}
+	}
+
+	rn.log = newLog
+	rn.LastIncludedIndex = args.LastIncludedIndex
+	rn.LastIncludedTerm = args.LastIncludedTerm
+	rn.snapshot = args.Data
+
+	// advance volatile markers past snapshot
+	if args.LastIncludedIndex > rn.LastIncludedIndex {
+		rn.currentTerm = args.LastIncludedIndex
+	}
+
+	if args.LastIncludedIndex > rn.lastApplied {
+		rn.lastApplied = args.LastIncludedIndex
+	}
+
+	rn.persist()
+
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+
+	rn.mu.Unlock()
+
+	// pass the snapshot to the state machine outside the lock
+	go func(msg ApplyMsg) {
+		rn.ApplyCh <- msg
+	}(applyMsg)
+
+	return nil
+}
