@@ -19,6 +19,14 @@ const (
 	LEADER
 )
 
+type EntryType int
+
+const (
+	COMMAND_ENTRY EntryType = iota
+	ADD_NODE_ENTRY
+	REMOVE_NODE_ENTRY
+)
+
 type InstallSnaphotArgs struct {
 	Term              int
 	LeaderID          string
@@ -80,8 +88,9 @@ type RequestVoteReply struct {
 }
 
 type LogEntry struct {
-	Index   int    // Serial number
-	Term    int    // Election term this was created in
+	Index   int // Serial number
+	Term    int // Election term this was created in
+	Type    EntryType
 	Command []byte // actual raw RESP
 }
 
@@ -525,6 +534,15 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 	rn.log = append(rn.log, args.Entries...)
 	rn.persist()
 
+	// scan newly append entries for configuration changes
+	for _, entry := range args.Entries {
+		if entry.Type == ADD_NODE_ENTRY {
+			rn.addPeer(string(entry.Command))
+		} else if entry.Type == REMOVE_NODE_ENTRY {
+			rn.removePeer(string(entry.Command))
+		}
+	}
+
 	// update commit index
 	if args.LeaderCommit > rn.commitIndex {
 		lastNewEntryIndex := rn.getLastLogIndex()
@@ -587,6 +605,36 @@ func (rn *RaftNode) StartServer() error {
 	return nil
 }
 
+func (rn *RaftNode) SubmitConfigChange(changeType EntryType, peerAddr string) (bool, int) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.state != LEADER {
+		return false, -1
+	}
+
+	entry := LogEntry{
+		Index:   rn.getLastLogIndex() + 1,
+		Term:    rn.currentTerm,
+		Type:    changeType,
+		Command: []byte(peerAddr),
+	}
+
+	// append own log
+	rn.log = append(rn.log, entry)
+	rn.persist()
+
+	// apply locally
+	if changeType == ADD_NODE_ENTRY {
+		rn.addPeer(peerAddr)
+	} else {
+		rn.removePeer(peerAddr)
+	}
+	fmt.Printf("Leader %s append entry %d (Term %d) to its own local log\n", rn.id, entry.Index, entry.Term)
+
+	return true, entry.Index
+}
+
 func (rn *RaftNode) Submit(command []byte) (bool, int) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -601,6 +649,7 @@ func (rn *RaftNode) Submit(command []byte) (bool, int) {
 	entry := LogEntry{
 		Index:   index,
 		Term:    term,
+		Type:    COMMAND_ENTRY,
 		Command: command,
 	}
 
@@ -611,6 +660,43 @@ func (rn *RaftNode) Submit(command []byte) (bool, int) {
 	fmt.Printf("Leader %s append entry %d (Term %d) to its own local log\n", rn.id, index, term)
 
 	return true, index
+}
+
+func (rn *RaftNode) addPeer(peerAddr string) {
+	for _, p := range rn.peers {
+		if p == peerAddr {
+			return // already exists
+		}
+	}
+
+	fmt.Printf("Node %s adding new peer: %s\n", rn.id, peerAddr)
+	rn.peers = append(rn.peers, peerAddr)
+
+	if rn.state == LEADER {
+		// set nextIndex to 1 or (lastINcludedIndex + 1) so we immediately
+		// an InstallSnapshot to catch the brand new empty node
+		rn.nextIndex[peerAddr] = rn.LastIncludedIndex + 1
+		rn.matchIndex[peerAddr] = 0
+	}
+}
+
+func (rn *RaftNode) removePeer(peerAddr string) {
+	var newPeers []string
+
+	for _, p := range rn.peers {
+		if p != peerAddr {
+			newPeers = append(newPeers, p)
+		}
+	}
+
+	rn.peers = newPeers
+
+	if rn.state == LEADER {
+		delete(rn.nextIndex, peerAddr)
+		delete(rn.matchIndex, peerAddr)
+	}
+
+	fmt.Printf("Node %s removed peer: %s\n", rn.id, peerAddr)
 }
 
 // checks if the majority of followers have replicated a log entry
