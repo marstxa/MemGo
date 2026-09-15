@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/marstxa/handler"
 	"github.com/marstxa/raft"
 	"github.com/marstxa/resp"
 	"github.com/marstxa/store"
+	waitregistry "github.com/marstxa/waitRegistry"
 )
 
 const SNAPSHOT_THRESHOLD = 50 // Compact whenever uncompacted log exceed x(default: 50) entries
@@ -34,6 +36,7 @@ func main() {
 	// initialise raft consensus engine
 	applyCh := make(chan raft.ApplyMsg, 100)
 	raftNode := raft.NewRaftNode(*id, peers, applyCh)
+	reg := waitregistry.NewWaitRegistry()
 
 	err := raftNode.StartServer()
 	if err != nil {
@@ -41,7 +44,7 @@ func main() {
 		return
 	}
 
-	go runStateMachine(raftNode, applyCh, h, s)
+	go runStateMachine(raftNode, applyCh, h, s, reg)
 
 	// listening
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
@@ -58,13 +61,13 @@ func main() {
 			continue
 		}
 
-		go handleConn(conn, h, raftNode)
+		go handleConn(conn, h, raftNode, reg)
 
 	}
 }
 
 // listens for commited log entries and applies them to the Redis
-func runStateMachine(rn *raft.RaftNode, applyCh chan raft.ApplyMsg, h *handler.Handler, s *store.Store) {
+func runStateMachine(rn *raft.RaftNode, applyCh chan raft.ApplyMsg, h *handler.Handler, s *store.Store, reg *waitregistry.WaitRegeistry) {
 	for msg := range applyCh {
 		if msg.SnapshotValid {
 			err := s.RestoreSnapshot(msg.Snapshot)
@@ -90,6 +93,9 @@ func runStateMachine(rn *raft.RaftNode, applyCh chan raft.ApplyMsg, h *handler.H
 			if commandFunc, ok := h.Handlers[command]; ok {
 				commandFunc(args)
 				fmt.Printf("State machine applied %s command successfully.\n", commandFunc)
+
+				// wake up any waiting TCP clients
+				reg.Notify(msg.CommandIndex)
 			}
 
 			// check if log exceed threshold
@@ -107,7 +113,7 @@ func runStateMachine(rn *raft.RaftNode, applyCh chan raft.ApplyMsg, h *handler.H
 	}
 }
 
-func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode) {
+func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode, reg *waitregistry.WaitRegeistry) {
 	defer conn.Close()
 
 	for {
@@ -137,7 +143,7 @@ func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode) {
 			tempWriter.Write(value)
 
 			// submit to raft
-			isLeader, _ := rn.Submit(buf.Bytes())
+			isLeader, logIndex := rn.Submit(buf.Bytes())
 
 			if !isLeader {
 				// reject the write
@@ -154,8 +160,17 @@ func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode) {
 				continue
 			}
 
-			// For now reply OK immediately
-			writer.Write(resp.Value{Typ: "string", Str: "OK"})
+			// register a ch for the log index
+			waitChan := reg.Register(logIndex)
+
+			// pause the loop and wait for cluster to reach consensus
+			select {
+			case <-waitChan:
+				writer.Write(resp.Value{Typ: "string", Str: "OK"})
+			case <-time.After(2 * time.Second):
+				// consensus failed
+				writer.Write(resp.Value{Typ: "error", Str: "ERR timeout waiting for consensus"})
+			}
 			continue
 		}
 
