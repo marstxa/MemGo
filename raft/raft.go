@@ -97,6 +97,8 @@ type RaftNode struct {
 	votedFor    string // candidate id that received vote in current term
 	log         []LogEntry
 
+	currentLeader string
+
 	// snapshot state
 	LastIncludedIndex int
 	LastIncludedTerm  int
@@ -297,8 +299,15 @@ func (rn *RaftNode) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) e
 	return nil
 }
 
+func (rn *RaftNode) GetLeader() string {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	return rn.currentLeader
+}
+
 func (rn *RaftNode) becomeLeader() {
 	rn.state = LEADER
+	rn.currentLeader = rn.id
 	fmt.Printf("Node %s WON THE ELECTION! Now Leader for Term %d\n", rn.id, rn.currentTerm)
 
 	rn.nextIndex = make(map[string]int)
@@ -487,6 +496,8 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 		// another node won the election for this term
 		rn.state = FOLLOWER
 	}
+
+	rn.currentLeader = args.LeaderID
 	reply.Term = rn.currentTerm
 
 	// handle log entries

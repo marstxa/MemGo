@@ -141,7 +141,16 @@ func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode) {
 
 			if !isLeader {
 				// reject the write
-				writer.Write(resp.Value{Typ: "error", Str: "ERR I am not the Leader Node"})
+				leaderID := rn.GetLeader()
+				var errMsg string
+
+				if leaderID == "" {
+					errMsg = "ERR Cluster is currently electing a new leader. Please try again."
+				} else {
+					errMsg = fmt.Sprint("ERR MOVED to Leader %s", leaderID)
+				}
+
+				writer.Write(resp.Value{Typ: "error", Str: errMsg})
 				continue
 			}
 
