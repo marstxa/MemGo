@@ -127,8 +127,52 @@ func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode, reg *waitr
 		args := value.Array[1:]
 		writer := resp.NewWriter(conn)
 
-		commandFunc, ok := h.Handlers[command]
+		// Intercept CLUSTER commands
+		if command == "CLUSTER" && len(args) >= 2 {
+			subCommand := strings.ToUpper(args[0].Bulk)
+			peerAddr := args[1].Bulk
 
+			var changeType raft.EntryType
+			if subCommand == "JOIN" {
+				changeType = raft.ADD_NODE_ENTRY
+			} else if subCommand == "LEAVE" {
+				changeType = raft.REMOVE_NODE_ENTRY
+			} else {
+				writer.Write(resp.Value{Typ: "error", Str: "ERR unknown CLUSTER subcommand"})
+				continue
+			}
+
+			// submit to raft
+			isLeader, logIndex := rn.SubmitConfigChange(changeType, peerAddr)
+
+			if !isLeader {
+				leaderID := rn.GetLeader()
+				var errMsg string
+				if leaderID == "" {
+					errMsg = "ERR Cluster is currently electing a new leader. Please try again."
+				} else {
+					// FIX: Changed Sprint to Sprintf
+					errMsg = fmt.Sprintf("ERR MOVED to Leader %s", leaderID)
+				}
+				writer.Write(resp.Value{Typ: "error", Str: errMsg})
+				continue
+			}
+
+			// register a ch for the log index
+			waitChan := reg.Register(logIndex)
+
+			// pause the loop and wait for cluster to reach consensus
+			select {
+			case <-waitChan:
+				writer.Write(resp.Value{Typ: "string", Str: "OK"})
+			case <-time.After(2 * time.Second):
+				writer.Write(resp.Value{Typ: "error", Str: "ERR timeout waiting for consensus"})
+			}
+			continue // We are done with the CLUSTER command, loop back!
+		}
+
+		// Handle normal Redis commands (SET, GET, etc)
+		commandFunc, ok := h.Handlers[command]
 		if !ok {
 			writer.Write(resp.Value{Typ: "error", Str: "ERR unknown command"})
 			continue
@@ -146,34 +190,31 @@ func handleConn(conn net.Conn, h *handler.Handler, rn *raft.RaftNode, reg *waitr
 			isLeader, logIndex := rn.Submit(buf.Bytes())
 
 			if !isLeader {
-				// reject the write
 				leaderID := rn.GetLeader()
 				var errMsg string
-
 				if leaderID == "" {
 					errMsg = "ERR Cluster is currently electing a new leader. Please try again."
 				} else {
-					errMsg = fmt.Sprint("ERR MOVED to Leader %s", leaderID)
+					// FIX: Changed Sprint to Sprintf
+					errMsg = fmt.Sprintf("ERR MOVED to Leader %s", leaderID)
 				}
-
 				writer.Write(resp.Value{Typ: "error", Str: errMsg})
 				continue
 			}
 
-			// register a ch for the log index
+			// Wait for consensus
 			waitChan := reg.Register(logIndex)
-
-			// pause the loop and wait for cluster to reach consensus
 			select {
 			case <-waitChan:
+				// Only AFTER consensus do we apply the command to the local store and say OK
 				writer.Write(resp.Value{Typ: "string", Str: "OK"})
 			case <-time.After(2 * time.Second):
-				// consensus failed
 				writer.Write(resp.Value{Typ: "error", Str: "ERR timeout waiting for consensus"})
 			}
 			continue
 		}
 
+		// Handle Read-Only commands (GET, PING, etc)
 		result := commandFunc(args)
 		writer.Write(result)
 	}
