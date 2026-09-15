@@ -68,8 +68,10 @@ type AppendEntriesReply struct {
 }
 
 type RequestVoteArgs struct {
-	Term        int
-	CandidateID string
+	Term         int
+	CandidateID  string
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
@@ -197,6 +199,10 @@ func (rn *RaftNode) requestVotes(term int) {
 	rn.mu.Lock()
 	votesReceived := 1 // voted for ourselves already
 
+	lastIndex := rn.getLastLogIndex()
+	realLastIdx := rn.getRealIndex(lastIndex)
+	lastTerm := rn.log[realLastIdx].Term
+
 	// Need more than half of the total servers to win
 	majority := (len(rn.peers)+1)/2 + 1
 	rn.mu.Unlock()
@@ -204,8 +210,10 @@ func (rn *RaftNode) requestVotes(term int) {
 	for _, peer := range rn.peers {
 		go func(peerAddr string) {
 			args := RequestVoteArgs{
-				Term:        term,
-				CandidateID: rn.id,
+				Term:         term,
+				CandidateID:  rn.id,
+				LastLogIndex: lastIndex,
+				LastLogTerm:  lastTerm,
 			}
 
 			var reply RequestVoteReply
@@ -252,6 +260,22 @@ func (rn *RaftNode) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) e
 	if args.Term > rn.currentTerm {
 		rn.stepDown(args.Term)
 		reply.Term = rn.currentTerm
+	}
+
+	myLastIndex := rn.getLastLogIndex()
+	myRealLastIdx := rn.getRealIndex(myLastIndex)
+	myLastTerm := rn.log[myRealLastIdx].Term
+
+	logUpToDate := false
+	if args.LastLogTerm > myLastTerm {
+		logUpToDate = true
+	} else if args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIndex {
+		logUpToDate = true
+	}
+
+	if !logUpToDate {
+		// reject candidate
+		return nil
 	}
 
 	if rn.votedFor == "" || rn.votedFor == args.CandidateID {
@@ -301,6 +325,14 @@ func (rn *RaftNode) becomeLeader() {
 }
 
 func (rn *RaftNode) stepDown(newTerm int) {
+	if newTerm <= rn.currentTerm && rn.state == FOLLOWER {
+		return
+	}
+
+	if newTerm < rn.currentTerm {
+		return
+	}
+
 	rn.currentTerm = newTerm
 	rn.state = FOLLOWER
 	rn.votedFor = ""
@@ -341,15 +373,15 @@ func (rn *RaftNode) sendHeartbeats() {
 					rn.mu.Unlock()
 
 					go func(targetPeer string, snapArgs InstallSnaphotArgs) {
-						var reply InstallSnaphotReply
-						err := rn.sendRPC(targetPeer, "RaftNode.InstallSnapshot", snapArgs, &reply)
+						var snapReply InstallSnaphotReply
+						err := rn.sendRPC(targetPeer, "RaftNode.InstallSnapshot", snapArgs, &snapReply)
 
 						if err == nil {
 							rn.mu.Lock()
 							defer rn.mu.Unlock()
 
-							if reply.Term > rn.currentTerm {
-								rn.stepDown(reply.Term)
+							if snapReply.Term > rn.currentTerm {
+								rn.stepDown(snapReply.Term)
 								return
 							}
 
@@ -397,12 +429,13 @@ func (rn *RaftNode) sendHeartbeats() {
 				err := rn.sendRPC(peerAddr, "RaftNode.AppendEntries", args, &reply)
 				if err == nil {
 					rn.mu.Lock()
-					defer rn.mu.Unlock()
 
 					if reply.Term > rn.currentTerm {
 						rn.stepDown(reply.Term)
 						return
 					}
+
+					defer rn.mu.Unlock()
 
 					// ONLY process reply if we are still the leader
 					if rn.state == LEADER && rn.currentTerm == term {
@@ -411,14 +444,15 @@ func (rn *RaftNode) sendHeartbeats() {
 							rn.matchIndex[peerAddr] = rn.nextIndex[peerAddr] - 1
 							rn.advanceCommitIndex()
 						} else {
-							// decrement index so we send older data to next heartbeat
-							if rn.nextIndex[peerAddr] > rn.LastIncludedIndex+1 {
+							// Only decrement if nextIndex hasn't changed concurrently
+							if rn.nextIndex[peerAddr] == nextIdx && rn.nextIndex[peerAddr] > 1 {
 								rn.nextIndex[peerAddr]--
 							}
 							fmt.Printf("Follower %s rejected log; backtracking nextIndex to %d\n", peerAddr, rn.nextIndex[peerAddr])
 						}
 					}
 				}
+
 			}(peer)
 		}
 
@@ -436,14 +470,9 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 
 	// reject if older term
 	if args.Term < rn.currentTerm {
-		return nil
-	}
-
-	// if we are a candidate, older leader and see a valid hearbeat, we lost the election so stepdown
-	if args.Term > rn.currentTerm || rn.state == CANDIDATE {
-		rn.stepDown(args.Term)
+		reply.Success = false
 		reply.Term = rn.currentTerm
-
+		return nil
 	}
 
 	select {
@@ -451,10 +480,20 @@ func (rn *RaftNode) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRe
 	default:
 	}
 
+	// if we are a candidate, older leader and see a valid hearbeat, we lost the election so stepdown
+	if args.Term > rn.currentTerm {
+		rn.stepDown(args.Term)
+	} else if rn.state == CANDIDATE && args.Term == rn.currentTerm {
+		// another node won the election for this term
+		rn.state = FOLLOWER
+	}
+	reply.Term = rn.currentTerm
+
 	// handle log entries
 	lastLogIndex := rn.getLastLogIndex()
 
 	if args.PrevLogIndex < rn.LastIncludedIndex {
+		reply.Success = false
 		return nil
 	}
 
@@ -769,4 +808,11 @@ func (rn *RaftNode) InstallSnaphot(args InstallSnaphotArgs, reply *InstallSnapho
 	}(applyMsg)
 
 	return nil
+}
+
+// return the number of uncompacted log entries currently in memory
+func (rn *RaftNode) RaftStateSize() int {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	return len(rn.log)
 }

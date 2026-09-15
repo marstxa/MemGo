@@ -13,6 +13,8 @@ import (
 	"github.com/marstxa/store"
 )
 
+const SNAPSHOT_THRESHOLD = 50 // Compact whenever uncompacted log exceed x(default: 50) entries
+
 func main() {
 	port := flag.Int("port", 6379, "TCP port to listen on for clients")
 	id := flag.String("id", "", "This node's Raft address (e.g. localhost:6001)")
@@ -39,7 +41,7 @@ func main() {
 		return
 	}
 
-	go runStateMachine(applyCh, h)
+	go runStateMachine(raftNode, applyCh, h, s)
 
 	// listening
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
@@ -62,7 +64,7 @@ func main() {
 }
 
 // listens for commited log entries and applies them to the Redis
-func runStateMachine(applyCh chan raft.ApplyMsg, h *handler.Handler, s *store.Store) {
+func runStateMachine(rn *raft.RaftNode, applyCh chan raft.ApplyMsg, h *handler.Handler, s *store.Store) {
 	for msg := range applyCh {
 		if msg.SnapshotValid {
 			err := s.RestoreSnapshot(msg.Snapshot)
@@ -88,6 +90,18 @@ func runStateMachine(applyCh chan raft.ApplyMsg, h *handler.Handler, s *store.St
 			if commandFunc, ok := h.Handlers[command]; ok {
 				commandFunc(args)
 				fmt.Printf("State machine applied %s command successfully.\n", commandFunc)
+			}
+
+			// check if log exceed threshold
+			if rn.RaftStateSize() > SNAPSHOT_THRESHOLD {
+				snapData, err := s.ExportSnapshot()
+				if err != nil {
+					fmt.Printf("Failed to export snapshot: %v\n", err)
+					continue
+				}
+
+				// instruct raft to discard entires up to this applied index
+				rn.Snapshot(msg.CommandIndex, snapData)
 			}
 		}
 	}
